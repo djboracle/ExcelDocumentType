@@ -1,0 +1,1132 @@
+/*
+    This file is part of the ExcelDocumentType application set.
+
+    ExcelDocumentType is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    ExcelDocumentType is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with ExcelDocumentType.  If not, see <http://www.gnu.org/licenses/>.
+*/
+
+/*
+
+   Summary of changes ...
+
+   07/29/2009 - Marc Wibbing of 3C-Gruppe added functionality for column captions and
+                the ability to add formulas to the quick report.
+
+   08/12/2009 - Jason Bennett added ability to create worksheet title row.
+
+   09/04/2009 - Jason Bennett added ability to create worksheet level conditional formatting on cell data.
+   
+   11/05/2009 - Jason Bennett added ability to add hyperlinked data to a cell.
+   
+   12/21/2009 - Jason Bennett added ability to add header and footer sections to individual worksheets.
+   
+   12/22/2009 - Angus Lam added code that simplifies the use of SUM,AVERAGE, MIN, MAX, and COUNT formulas.
+   
+   01/05/2010 - Jason Bennett added the ability to apply a custom style to the column heading.
+   
+   01/05/2010 - Jason Bennett updated style record type to include an option for text rotation.
+   
+   02/21/2010 - Jason Bennett rolled in changes to style and HF page margins as per Konstantin Kostyuchenko 
+   
+   03/28/2010 - Jason Bennett added new attribute "worksheet_list_delimiter" to  T_WORKSHEET_DATA allowing
+                the user to choose the list delimiter for item lists like header list, or style list etc ...
+                the default delimiter will be a comma.
+                
+   04/27/2010 - Jason Bennett added Header Row Freeze attribute.
+   05/11/2010 - Jason Bennett added attribute to freeze first worksheet column.
+   05/21/2010 - Jason Bennett added attribute to turn gridlines on or off.
+   05/31/2010 - Jason Bennett added attribute for page orientation
+   05/31/2010 - Jason Bennett added attribute for repeating header row.
+   
+   01/15/2012 - Jason Bennett added process developed by Paul Jensen that makes specifying number of columns optional, and generates default column headers.
+*/
+
+SET SCAN OFF;
+
+DROP TYPE RESULT_TABLE;
+DROP TYPE T_ROW_NUMBER;
+DROP TYPE T_ROW;
+
+CREATE OR REPLACE TYPE T_ROW AS TABLE OF VARCHAR2(32000);
+/
+CREATE OR REPLACE TYPE T_ROW_NUMBER AS TABLE OF NUMBER(3);
+/
+CREATE OR REPLACE TYPE RESULT_TABLE AS TABLE OF T_ROW; 
+/
+
+CREATE OR REPLACE PACKAGE ExcelDocTypeUtils AS
+
+  
+   /* These constants are associated with the creation hyperlink cells.
+   
+      hyperlinked data should look like: ExcelHRef:::#Sheet1!A1:::Sheet1 (<hrefIndicator>:::<target>:::<label>)
+	   or ExcelHref:::http://www.google.com:::Google
+   
+   */
+
+   HREF_INDICATOR CONSTANT VARCHAR2(9) := 'ExcelHRef';
+   HREF_SEP_CHAR  CONSTANT VARCHAR2(3)  := ':::';
+   
+   HF_PAGE_NUMBER_SINGLE CONSTANT VARCHAR2(3) := 'PNS';  /* 1 */
+   HF_PAGE_NUMBER_PAGES  CONSTANT VARCHAR2(3) := 'PNP';  /* 1 of 3 ... */
+   HF_DATE               CONSTANT VARCHAR2(3) := 'SDT';  /* single date, no time */
+   HF_DATE_TIME          CONSTANT VARCHAR2(3) := 'DTT';  /* Date and Time */
+   HF_TEXT               CONSTANT VARCHAR2(3) := 'TXT';  /* Free text ... title */
+   HF_FILEPATH           CONSTANT VARCHAR2(3) := 'FPT';  /* File Path to location opened from */
+   
+   HF_LEFT               CONSTANT VARCHAR2(3)  := 'LFT';
+   HF_RIGHT              CONSTANT VARCHAR2(3)  := 'RHT';
+   HF_CENTER             CONSTANT VARCHAR2(3)  := 'CTR';
+   
+   -- Page Orientation Indicators
+   WS_ORIENT_PORTRAIT    CONSTANT VARCHAR(8)   := 'Portrait';
+   WS_ORIENT_LANDSCAPE   CONSTANT VARCHAR(9)   := 'Landscape';
+   
+   TYPE t_refcursor IS REF CURSOR;
+
+   pv_result_table  RESULT_TABLE := RESULT_TABLE();
+
+
+   /* This type allows the user to create a title row at the top of a worksheet */
+
+   TYPE T_SHEET_TITLE IS RECORD(
+       title      VARCHAR2(1000),
+       cell_span  NUMBER(12),
+       style      VARCHAR2(200)
+   );
+
+   /* This type allows the user to add conditional formatting to worksheet cells. */
+
+   TYPE T_CONDITION IS RECORD(
+       qualifier    VARCHAR2(200),
+       value        VARCHAR2(200),
+       format_style VARCHAR2(500)
+   );
+
+   /* An Array of COND that allows the user to add multiple conditions to a worksheet. */
+   TYPE CONDITIONS_TABLE IS TABLE OF T_CONDITION;
+
+
+   TYPE T_CONDITIONAL_FORMATS IS RECORD(
+      range             VARCHAR2(200),
+      conditions        CONDITIONS_TABLE
+   );
+   
+
+   TYPE CONDITIONAL_FORMATS_TABLE IS TABLE OF T_CONDITIONAL_FORMATS;
+   
+   /* These types allow the user to associate a print header and footer with a worksheet. */
+   TYPE T_WORKSHEET_HF_DATA IS RECORD(
+       hf_type       VARCHAR2(3),
+	   text          VARCHAR2(200),
+	   position      VARCHAR2(3),
+       fontsize      VARCHAR2(3) 
+   );
+   
+   TYPE T_WORKSHEET_HF_MARGINS IS RECORD(
+        Zoom          NUMBER(4),
+        PageBreakZoom NUMBER(4),
+        MarginB       NUMBER(4), 
+        MarginT       NUMBER(4),
+        MarginL       NUMBER(4),
+        MarginR       NUMBER(4)      
+   );
+   
+   
+   TYPE WORKSHEET_HF_TABLE IS TABLE OF T_WORKSHEET_HF_DATA;
+   
+
+   /* This record contains all of the components required to create an Excel Report worksheet. */
+   TYPE T_WORKSHEET_DATA IS RECORD(
+       query                        VARCHAR2(16000),
+       title                        T_SHEET_TITLE,
+       worksheet_name               VARCHAR2(50),
+       worksheet_header             WORKSHEET_HF_TABLE,
+       worksheet_footer             WORKSHEET_HF_TABLE, 
+	   worksheet_page_margins       T_WORKSHEET_HF_MARGINS,
+       worksheet_cond_formats       CONDITIONAL_FORMATS_TABLE,
+       worksheet_list_delimiter     VARCHAR2(10),
+       worksheet_orientation        VARCHAR2(9),
+       worksheet_show_gridlines     BOOLEAN,
+       col_header_freeze            BOOLEAN,
+       col_header_repeat            BOOLEAN,
+	   col_firstcol_freeze          BOOLEAN,
+       col_count                    NUMBER(3),
+       col_width_list               VARCHAR2(500),
+       col_caption                  VARCHAR2(2000),
+       col_header_list              VARCHAR2(2000),
+       col_header_style_list        VARCHAR2(2000),
+       col_datatype_list            VARCHAR2(4000),
+       col_style_list               VARCHAR2(5000),
+       col_formula_list             VARCHAR2(4000),
+       col_formula_style_list       VARCHAR2(4000)
+   );
+
+
+   /* An Array of T_WORKSHEET_DATA allows us to create an excel document with multiple worksheets based on
+      different queries. */
+   TYPE WORKSHEET_TABLE IS TABLE OF T_WORKSHEET_DATA;
+
+
+   /* This record structure matches the createStyle method of the ExcelDocumentType. */
+   TYPE T_STYLE_DEF IS RECORD(
+                                p_style_id         VARCHAR2(50),
+                                p_font             VARCHAR2(50),
+                                p_ffamily          VARCHAR2(50),
+                                p_fsize            VARCHAR2(50),
+                                p_bold             VARCHAR2(1),
+                                p_italic           VARCHAR2(1),
+                                p_underline        VARCHAR2(10),
+                                p_text_color       VARCHAR2(50),
+                                p_cell_color       VARCHAR2(50),
+                                p_cell_pattern     VARCHAR2(50),
+                                p_align_vertical   VARCHAR2(50),
+                                p_align_horizontal VARCHAR2(50),
+								p_align_indent     VARCHAR2(50),
+                                p_wrap_text        VARCHAR2(1),
+                                p_rotate_text_deg  VARCHAR2(3),
+                                p_number_format    VARCHAR2(100),
+                                p_custom_xml       VARCHAR2(4000) 
+                             );
+
+
+   /* Collection of styles that can applied to cells */
+   TYPE STYLE_LIST IS TABLE OF T_STYLE_DEF;
+   
+
+   /* These four procedures are convenience procedures that make it easy to a record to it associated collection. */
+
+   PROCEDURE addStyleType(p_style_array IN OUT NOCOPY STYLE_LIST, p_style_rec T_STYLE_DEF);
+
+   PROCEDURE addWorksheetType(p_worksheet_data IN OUT NOCOPY WORKSHEET_TABLE, p_worksheet_rec T_WORKSHEET_DATA);
+
+   PROCEDURE addConditionType(p_condition_data IN OUT NOCOPY CONDITIONS_TABLE, p_condition_rec T_CONDITION);
+
+   PROCEDURE addConditionalFormatType(p_cond_format_data IN OUT NOCOPY CONDITIONAL_FORMATS_TABLE, p_cond_format_rec T_CONDITIONAL_FORMATS);
+   
+   PROCEDURE addHeaderFooterType(p_hf_data IN OUT NOCOPY WORKSHEET_HF_TABLE, p_hf_rec T_WORKSHEET_HF_DATA);
+   
+   /* This function creates an ExcelDocTypeUtils Worksheet hyperlink reference. */
+   FUNCTION createWorksheetLink(p_worksheet_name VARCHAR2 := NULL,
+                                p_link_text      VARCHAR2 := NULL) RETURN VARCHAR2;
+                                
+     /* This function creates an ExcelDocTypeUtils External hyperlink reference. */
+   FUNCTION createExternalLink(p_url        VARCHAR2 := NULL,
+                               p_link_text  VARCHAR2 := NULL) RETURN VARCHAR2;
+                               
+   /* Given select statement, this function will generate a Column Header list based on column details or column alias in the query's SELECT clause.
+      The p_list_delimiter parameter needs to match the list delimiter defined for the current worksheet. */
+   FUNCTION getColHeaderString(p_query          VARCHAR2 := NULL,
+                               p_list_delimiter VARCHAR2 := ',') RETURN VARCHAR2;
+                               
+                               
+               
+
+   /* This function creates the Excel Document based on the data passed in the p_worksheet_data collection. */
+
+   FUNCTION createExcelDocument(p_worksheet_data WORKSHEET_TABLE,
+                                p_style_data     STYLE_LIST := STYLE_LIST()) RETURN ExcelDocumentType;   
+
+
+END;
+/
+sho err;
+
+/***********************************************************************************************************************************************************************/
+/************************************************************************* PACKAGE BODY ********************************************************************************/
+/***********************************************************************************************************************************************************************/
+
+CREATE OR REPLACE PACKAGE BODY ExcelDocTypeUtils AS
+
+
+/*
+
+   Function that returns the element at the requested position in a delimited string.
+
+*/
+FUNCTION getStringElement(p_string    VARCHAR2,
+                          p_element   NUMBER,
+                          p_delimiter VARCHAR2 := ',',
+                          p_level     NUMBER   := 0)   RETURN VARCHAR2
+IS
+
+   v_string   VARCHAR2(2000) := NULL;
+   v_element  VARCHAR2(2000) := NULL;
+   v_next     VARCHAR2(2000) := NULL;
+
+   v_level    NUMBER(4)      := 0;
+   
+   v_delimiter VARCHAR2(200) := NVL(p_delimiter,',');
+
+
+BEGIN
+
+   v_level := p_level + 1;
+
+   v_element  := substr(p_string||v_delimiter,1,instr(p_string||v_delimiter,v_delimiter)-1);
+
+   -- need to look ahead to make sure we handle the null elements.
+   v_next     := substr(p_string||p_delimiter,instr(p_string||v_delimiter,v_delimiter),length(v_delimiter));
+
+   IF ((v_level >= p_element) OR (v_element IS NULL AND v_next != v_delimiter)) THEN
+
+      RETURN v_element;
+
+   ELSE
+
+      v_string := substr(p_string||v_delimiter,instr(p_string||v_delimiter,v_delimiter)+length(v_delimiter),length(p_string));
+
+      RETURN getStringElement(v_string,p_element,v_delimiter,v_level);
+
+   END IF;
+
+
+END;
+
+/*========================================================================================================*/
+FUNCTION isHRefData(p_data VARCHAR2 := NULL) RETURN BOOLEAN
+IS
+
+   v_return BOOLEAN := FALSE;
+
+BEGIN
+
+   IF INSTR(p_data,HREF_INDICATOR,1) > 0 THEN
+   
+     v_return := TRUE;
+	 
+   END IF;
+
+
+   RETURN v_return;
+
+END;
+
+
+/*=========================================================================================================*/
+
+FUNCTION getLinkTarget(p_data VARCHAR2 := NULL) RETURN VARCHAR2
+IS
+
+   v_target VARCHAR2(2000) := NULL;
+
+BEGIN
+
+   v_target := getStringElement(p_data,2,HREF_SEP_CHAR);
+   
+   RETURN v_target;
+
+END;
+
+/*=========================================================================================================*/
+
+FUNCTION getLinkLabel(p_data VARCHAR2 := NULL) RETURN VARCHAR2
+IS
+
+   v_label VARCHAR2(2000) := NULL;
+
+BEGIN
+
+   v_label := getStringElement(p_data,3,HREF_SEP_CHAR);
+   
+   RETURN v_label;
+
+END;
+
+/*=========================================================================================================*/
+
+FUNCTION getColumnCount(p_query VARCHAR2 := NULL) RETURN NUMBER
+IS
+
+   v_cursor INTEGER;
+   v_colcnt INTEGER;
+   
+   v_descTbl DBMS_SQL.DESC_TAB2;
+   
+BEGIN
+
+   v_cursor := DBMS_SQL.open_cursor;
+   
+   DBMS_SQL.parse(v_cursor, p_query, DBMS_SQL.native);
+   
+   DBMS_SQL.describe_columns2(v_cursor, v_colcnt, v_descTbl);
+   
+   DBMS_SQL.close_cursor(v_cursor); 
+   
+   RETURN TO_NUMBER(v_colcnt);
+
+END;
+
+/*=========================================================================================================*/
+
+FUNCTION getColHeaderString(p_query          VARCHAR2 := NULL,
+                            p_list_delimiter VARCHAR2 := ',') RETURN VARCHAR2
+IS
+
+   v_cursor INTEGER;
+   v_colcnt INTEGER;
+   
+   v_descTbl DBMS_SQL.DESC_TAB2;
+   
+   v_headers VARCHAR2(32000) := NULL;
+
+BEGIN
+
+   v_cursor := DBMS_SQL.open_cursor;
+   
+   DBMS_SQL.parse(v_cursor, p_query, DBMS_SQL.native);
+   
+   DBMS_SQL.describe_columns2(v_cursor, v_colcnt, v_descTbl);
+   
+   FOR x IN 1 .. v_descTbl.COUNT LOOP
+   
+     CASE
+        WHEN x = 1 THEN
+          v_headers := REPLACE(v_descTbl(x).col_name,p_list_delimiter,' ');
+        ELSE
+          v_headers := v_headers||p_list_delimiter||REPLACE(v_descTbl(x).col_name,p_list_delimiter,' ');
+     END CASE;   
+   
+   END LOOP;
+   
+   DBMS_SQL.close_cursor(v_cursor); 
+   
+   RETURN v_headers;
+   
+
+END;
+
+/*=========================================================================================================*/
+
+FUNCTION getColHeaderLengths(p_header_string   VARCHAR2 := NULL,
+                             p_delimiter  VARCHAR2 := ',') RETURN VARCHAR2
+IS
+
+  v_elem_cnt       NUMBER := 0;
+  v_length_string  VARCHAR2(4000) := NULL;
+  
+BEGIN
+
+  v_elem_cnt := (LENGTH(REGEXP_REPLACE(p_header_string,'[^'||p_delimiter||']','')))+1;
+
+  IF v_elem_cnt > 0 THEN
+  
+     FOR x IN 1 .. v_elem_cnt LOOP
+     
+      CASE
+        WHEN x = 1 THEN
+          v_length_string := LENGTH(getStringElement(p_header_string,x,p_delimiter));
+        ELSE
+          v_length_string := v_length_string||','||LENGTH(getStringElement(p_header_string,x,p_delimiter));
+     END CASE;        
+     
+     END LOOP;
+
+  END IF;
+  
+  RETURN v_length_string;
+  
+END;
+
+/*=========================================================================================================*/
+/*
+    This function executes the given query and returns the data in a RESULT_TABLE Collection object.
+
+*/
+
+FUNCTION buildDataSet(p_query_string VARCHAR2 := NULL,
+                      p_col_count    NUMBER   := 0) RETURN RESULT_TABLE
+IS
+
+
+  v_row_symbol       VARCHAR2(20)    := 'v_row';
+  v_row_fetch        VARCHAR2(32000) := NULL;
+  v_row_extend       NUMBER(4)       := p_col_count;
+
+  v_query            VARCHAR2(16000) := p_query_string;
+
+  v_result_proc      VARCHAR2(32000) := 'DECLARE'||chr(10)||
+                                        ' TYPE t_refcursor IS REF CURSOR; '||chr(10)||
+                                        ' v_row T_ROW := T_ROW(); '||chr(10)||
+                                        ' v_query VARCHAR2(16000) := ''<q>''; '||chr(10)||
+                                        ' v_refcur t_refcursor; '||chr(10)||
+                                       'BEGIN '||chr(10)||
+                                       '   OPEN v_refcur FOR v_query; '||chr(10)||
+                                       '   LOOP '||chr(10)||
+                                       '    v_row.extend(<e>); '||chr(10)||
+                                       '    FETCH v_refcur INTO <f> ;'||chr(10)||
+                                       '    EXIT WHEN v_refcur%NOTFOUND; '||chr(10)||
+                                       '    ExcelDocTypeUtils.pv_result_table.EXTEND; '||chr(10)||
+                                       '    ExcelDocTypeUtils.pv_result_table(ExcelDocTypeUtils.pv_result_table.COUNT) := v_row; '||chr(10)||
+                                       '    v_row.DELETE; '||chr(10)||
+                                       '   END LOOP; '||chr(10)||
+                                       'END; ';
+
+BEGIN
+
+   FOR x IN 1 .. v_row_extend LOOP
+
+      v_row_fetch := v_row_fetch||v_row_symbol||'('||x||'),';
+  
+   END LOOP;
+
+   v_row_fetch := RTRIM(v_row_fetch,',');
+
+   v_result_proc := REPLACE(v_result_proc,'<q>',REPLACE(v_query,'''',''''''));
+
+   v_result_proc := REPLACE(v_result_proc,'<e>',to_char(v_row_extend));
+
+   v_result_proc := REPLACE(v_result_proc,'<f>',v_row_fetch);
+
+  
+   pv_result_table := RESULT_TABLE();
+
+   EXECUTE IMMEDIATE v_result_proc;
+
+   RETURN pv_result_table;
+  
+END;
+
+/*===================================================================================================================================================================*/
+PROCEDURE buildHeaderFooter(p_document     IN OUT NOCOPY ExcelDocumentType,
+                            p_margins      IN     T_WORKSHEET_HF_MARGINS,
+                            p_header_array IN     WORKSHEET_HF_TABLE,
+                            p_footer_array IN     WORKSHEET_HF_TABLE,
+                            p_orientation  IN     VARCHAR2 := NULL)
+IS
+
+  v_hdr_cnt  NUMBER(12) := 0;
+  v_ftr_cnt  NUMBER(12) := 0;
+  
+  v_data_rec   T_WORKSHEET_HF_DATA := NULL;
+  v_hf_string  VARCHAR2(200)       := NULL;
+  v_pos_string VARCHAR2(200)       := NULL;
+
+BEGIN
+
+   BEGIN
+      v_hdr_cnt := p_header_array.COUNT;
+   EXCEPTION WHEN COLLECTION_IS_NULL THEN NULL;
+   END;
+   
+   BEGIN
+      v_ftr_cnt := p_footer_array.COUNT;
+   EXCEPTION WHEN COLLECTION_IS_NULL THEN NULL;
+   END;  
+
+   IF (v_hdr_cnt + v_ftr_cnt) > 0 THEN
+   
+   
+      p_document.worksheetHeaderFooterOpen;
+      
+      -- Construct Header Components
+      FOR x IN 1 .. v_hdr_cnt LOOP
+        
+        v_data_rec   := p_header_array(x);
+        v_hf_string  := NULL;
+        v_pos_string := NULL;
+        
+        CASE
+          WHEN v_data_rec.position = HF_LEFT THEN
+             v_pos_string := p_document.WHF_FORMAT_LEFT;
+          WHEN v_data_rec.position = HF_RIGHT THEN
+             v_pos_string := p_document.WHF_FORMAT_RIGHT;
+          WHEN v_data_rec.position = HF_CENTER THEN
+             v_pos_string := p_document.WHF_FORMAT_CENTER;
+          ELSE
+             v_pos_string := p_document.WHF_FORMAT_RIGHT;
+        END CASE;
+        
+        CASE 
+          WHEN v_data_rec.hf_type = HF_PAGE_NUMBER_SINGLE THEN                   
+          
+             v_hf_string := v_pos_string||p_document.WHF_FORMAT_PAGE;
+          
+          WHEN v_data_rec.hf_type = HF_PAGE_NUMBER_PAGES THEN
+          
+            v_hf_string := v_pos_string||p_document.WHF_FORMAT_PAGE||' of '||p_document.WHF_FORMAT_PAGES;
+            
+          WHEN v_data_rec.hf_type = HF_DATE THEN
+          
+            v_hf_string := v_pos_string||p_document.WHF_FORMAT_DATE;
+            
+          WHEN v_data_rec.hf_type = HF_DATE_TIME THEN
+          
+            v_hf_string := v_pos_string||p_document.WHF_FORMAT_DATE||' '||p_document.WHF_FORMAT_TIME;
+            
+          WHEN v_data_rec.hf_type = HF_TEXT THEN
+          
+            v_hf_string := v_pos_string||p_document.WHF_FORMAT_FONT||v_data_rec.text;
+            
+          WHEN v_data_rec.hf_type = HF_FILEPATH THEN
+          
+            v_hf_string := v_pos_string||p_document.WHF_FORMAT_FILEPATH;
+            
+          ELSE
+          
+            v_hf_string := NULL;
+            
+          END CASE;
+          
+          IF v_hf_string IS NOT NULL THEN
+          
+             p_document.worksheetHeaderValues(p_headerstring=>v_hf_string,
+                                              p_fontsize=>v_data_rec.fontsize);
+          
+          END IF;
+      
+      END LOOP;
+      
+      -- Construct Footer Components
+      FOR x IN 1 .. v_ftr_cnt LOOP
+      
+        v_data_rec   := p_footer_array(x);
+        v_hf_string  := NULL;
+        v_pos_string := NULL;
+        
+        CASE
+          WHEN v_data_rec.position = HF_LEFT THEN
+             v_pos_string := p_document.WHF_FORMAT_LEFT;
+          WHEN v_data_rec.position = HF_RIGHT THEN
+             v_pos_string := p_document.WHF_FORMAT_RIGHT;
+          WHEN v_data_rec.position = HF_CENTER THEN
+             v_pos_string := p_document.WHF_FORMAT_CENTER;
+          ELSE
+             v_pos_string := p_document.WHF_FORMAT_RIGHT;
+        END CASE;
+        
+        CASE 
+          WHEN v_data_rec.hf_type = HF_PAGE_NUMBER_SINGLE THEN                   
+          
+             v_hf_string := v_pos_string||p_document.WHF_FORMAT_PAGE;
+          
+          WHEN v_data_rec.hf_type = HF_PAGE_NUMBER_PAGES THEN
+          
+            v_hf_string := v_pos_string||p_document.WHF_FORMAT_PAGE||' of '||p_document.WHF_FORMAT_PAGES;
+            
+          WHEN v_data_rec.hf_type = HF_DATE THEN
+          
+            v_hf_string := v_pos_string||p_document.WHF_FORMAT_DATE;
+            
+          WHEN v_data_rec.hf_type = HF_DATE_TIME THEN
+          
+            v_hf_string := v_pos_string||p_document.WHF_FORMAT_DATE||' '||p_document.WHF_FORMAT_TIME;
+            
+          WHEN v_data_rec.hf_type = HF_TEXT THEN
+          
+            v_hf_string := v_pos_string||p_document.WHF_FORMAT_FONT||v_data_rec.text;
+            
+          WHEN v_data_rec.hf_type = HF_FILEPATH THEN
+          
+            v_hf_string := v_pos_string||p_document.WHF_FORMAT_FILEPATH;
+            
+          ELSE
+          
+            v_hf_string := NULL;
+            
+          END CASE;
+          
+          IF v_hf_string IS NOT NULL THEN
+          
+             p_document.worksheetFooterValues(p_footerstring=>v_hf_string,
+                                              p_fontsize=>v_data_rec.fontsize);
+          
+          END IF;     
+      
+      END LOOP;
+
+      p_document.worksheetHeaderFooterClose(p_Zoom          => p_margins.Zoom,
+                                            p_PageBreakZoom => p_margins.PageBreakZoom,
+                                            p_MarginB       => p_margins.MarginB, 
+                                            p_MarginT       => p_margins.MarginT,
+                                            p_MarginL       => p_margins.MarginL,
+                                            p_MarginR       => p_margins.MarginR,
+                                            p_orientation   => p_orientation);
+      
+   END IF;
+
+END; 
+
+/*======================================================================================================================================================================*/
+
+PROCEDURE addStyleType(p_style_array IN OUT NOCOPY STYLE_LIST, p_style_rec T_STYLE_DEF)
+IS
+BEGIN
+
+   p_style_array.EXTEND;
+   p_style_array(p_style_array.COUNT) := p_style_rec;
+
+END;
+
+/*======================================================================================================================================================================*/
+
+PROCEDURE addWorksheetType(p_worksheet_data IN OUT NOCOPY WORKSHEET_TABLE, p_worksheet_rec T_WORKSHEET_DATA)
+IS
+BEGIN
+
+   p_worksheet_data.EXTEND;
+   p_worksheet_data(p_worksheet_data.COUNT) := p_worksheet_rec;
+
+END;
+
+/*======================================================================================================================================================================*/
+
+PROCEDURE addConditionType(p_condition_data IN OUT NOCOPY CONDITIONS_TABLE, p_condition_rec T_CONDITION)
+IS
+BEGIN
+
+   p_condition_data.EXTEND;
+   p_condition_data(p_condition_data.COUNT) := p_condition_rec;
+
+END;
+
+/*======================================================================================================================================================================*/
+
+PROCEDURE addConditionalFormatType(p_cond_format_data IN OUT NOCOPY CONDITIONAL_FORMATS_TABLE, p_cond_format_rec T_CONDITIONAL_FORMATS)
+IS
+BEGIN
+
+   p_cond_format_data.EXTEND;
+   p_cond_format_data(p_cond_format_data.COUNT) := p_cond_format_rec;
+
+END;
+
+/*======================================================================================================================================================================*/
+
+PROCEDURE addHeaderFooterType(p_hf_data IN OUT NOCOPY WORKSHEET_HF_TABLE, p_hf_rec T_WORKSHEET_HF_DATA)
+IS
+BEGIN
+
+   p_hf_data.EXTEND;
+   p_hf_data(p_hf_data.COUNT) := p_hf_rec;
+
+END;
+
+/*======================================================================================================================================================================*/
+
+FUNCTION createWorksheetLink(p_worksheet_name VARCHAR2 := NULL,
+                             p_link_text      VARCHAR2 := NULL) RETURN VARCHAR2
+IS
+
+  v_worksheet_name  VARCHAR2(31)  := NULL;
+  v_return_link     VARCHAR2(500) := NULL;
+  
+BEGIN
+
+ v_worksheet_name := SUBSTR(p_worksheet_name,1,31);
+  
+ IF INSTR(v_worksheet_name,' ') > 0 THEN
+ 
+    v_worksheet_name := ''''||v_worksheet_name||'''';
+ 
+ END IF;
+ 
+ v_return_link := HREF_INDICATOR||HREF_SEP_CHAR||'#'||v_worksheet_name||'!A1'||HREF_SEP_CHAR||p_link_text;
+
+ RETURN v_return_link;
+
+END;
+
+/*======================================================================================================================================================================*/
+ FUNCTION createExternalLink(p_url        VARCHAR2 := NULL,
+                             p_link_text  VARCHAR2 := NULL) RETURN VARCHAR2
+ IS
+ 
+    v_return_link     VARCHAR2(500) := NULL;
+ 
+ BEGIN
+ 
+    v_return_link :=  HREF_INDICATOR||HREF_SEP_CHAR||p_url||HREF_SEP_CHAR||p_link_text;
+    
+    RETURN v_return_link;
+ 
+ END;
+
+/*======================================================================================================================================================================*/
+/*
+
+   This functiom constructs and returns an ExcelDocumentType based upon the parameters passed 
+   in by the WORKSHEET_TABLE type parameter.
+
+
+*/
+FUNCTION createExcelDocument(p_worksheet_data WORKSHEET_TABLE,
+                             p_style_data     STYLE_LIST := STYLE_LIST()) RETURN ExcelDocumentType
+IS
+
+  resultDocument        ExcelDocumentType;
+  
+  v_worksheet_data      WORKSHEET_TABLE := WORKSHEET_TABLE();
+  
+  v_row                 T_ROW := T_ROW();  
+  v_results             RESULT_TABLE := RESULT_TABLE();
+
+  v_title               T_SHEET_TITLE := NULL;
+
+  v_style               T_STYLE_DEF := NULL;
+
+  v_default_col_width   NUMBER(3)    := 30;
+  v_col_width           NUMBER(3)    := 0;   
+
+  v_default_data_type   VARCHAR2(6)  := 'String';
+  v_data_type           VARCHAR2(20) := NULL;
+  v_data_style          VARCHAR2(50) := NULL;
+
+  v_style_list          VARCHAR2(4000) := ';';
+
+  v_count_rows          NUMBER(10);
+  v_formula             VARCHAR2(100);
+  
+  v_repeat_row          NUMBER(12) := 0;
+  v_freeze_row          NUMBER(12) := 0;
+  v_freeze_col          NUMBER(12) := 0;
+  v_show_gridlines      BOOLEAN    := TRUE;
+  
+  v_header_repeat_attr  VARCHAR2(20) := NULL;
+
+BEGIN
+
+  BEGIN
+
+     COMMIT;
+
+  EXCEPTION
+     WHEN OTHERS THEN NULL;
+  END;
+
+  
+  v_worksheet_data := p_worksheet_data;
+
+  resultDocument := ExcelDocumentType();
+
+  -- Open Document
+  resultDocument.documentOpen;
+
+  -- Define Customs Styles
+  resultDocument.stylesOpen;
+   
+  resultDocument.defaultStyle;
+
+  /* Style for Column Header Row */
+  resultDocument.createStyle(p_style_id =>'ColumnHeader',
+                                    p_font     =>'Times New Roman',
+                                    p_ffamily  =>'Roman',
+                                    p_fsize    =>'10',
+                                    p_bold     =>'Y',
+                                    p_underline =>'Single',
+                                    p_align_horizontal=>'Center',
+                                    p_align_vertical=>'Bottom');
+
+
+  FOR x IN 1 .. p_style_data.COUNT LOOP
+
+    v_style := p_style_data(x);
+
+    v_style_list := v_style_list||';'||UPPER(v_style.p_style_id);
+
+    resultDocument.createStyle(p_style_id         => UPPER(v_style.p_style_id),
+                               p_font             => v_style.p_font,
+                               p_ffamily          => v_style.p_ffamily,
+                               p_fsize            => v_style.p_fsize,
+                               p_bold             => v_style.p_bold,
+                               p_italic           => v_style.p_italic,
+                               p_underline        => v_style.p_underline,
+                               p_text_color       => v_style.p_text_color,
+                               p_cell_color       => v_style.p_cell_color,
+                               p_cell_pattern     => v_style.p_cell_pattern,
+                               p_align_vertical   => v_style.p_align_vertical,
+                               p_align_horizontal => v_style.p_align_horizontal,
+							   p_align_indent     => v_style.p_align_indent,
+                               p_wrap_text        => v_style.p_wrap_text,
+                               p_rotate_text_deg  => v_style.p_rotate_text_deg,
+                               p_number_format    => v_style.p_number_format,
+                               p_custom_xml       => v_style.p_custom_xml);
+
+
+  END LOOP;
+
+  resultDocument.stylesClose;
+
+
+  FOR ws_index IN 1 .. v_worksheet_data.COUNT LOOP
+
+     -- Open Worksheets
+
+     resultDocument.worksheetOpen(NVL(SUBSTR(v_worksheet_data(ws_index).worksheet_name,1,31),'Sheet'||ws_index));
+     
+     IF (v_worksheet_data(ws_index).col_count IS NULL) THEN
+     
+        v_worksheet_data(ws_index).col_count := getColumnCount(v_worksheet_data(ws_index).query);
+     
+     END IF;
+     
+     -- Add Header and/or Footer
+     buildHeaderFooter(p_document      => resultDocument,
+	                   p_margins       => v_worksheet_data(ws_index).worksheet_page_margins,
+                       p_header_array  => v_worksheet_data(ws_index).worksheet_header,
+                       p_footer_array  => v_worksheet_data(ws_index).worksheet_footer,
+                       p_orientation   => v_worksheet_data(ws_index).worksheet_orientation);
+
+
+     -- Define Conditional Formatting
+
+     BEGIN
+
+        FOR cf_index IN 1 .. v_worksheet_data(ws_index).worksheet_cond_formats.COUNT LOOP
+
+           resultDocument.worksheetCondFormatOpen(v_worksheet_data(ws_index).worksheet_cond_formats(cf_index).range);
+
+           BEGIN
+              FOR cond_index IN 1 .. v_worksheet_data(ws_index).worksheet_cond_formats(cf_index).conditions.COUNT LOOP
+
+                  resultDocument.createCondFormat(p_qualifier=>v_worksheet_data(ws_index).worksheet_cond_formats(cf_index).conditions(cond_index).qualifier,
+                                                  p_value=>v_worksheet_data(ws_index).worksheet_cond_formats(cf_index).conditions(cond_index).value,
+                                                  p_format_style=>v_worksheet_data(ws_index).worksheet_cond_formats(cf_index).conditions(cond_index).format_style);
+
+
+              END LOOP;
+           EXCEPTION WHEN COLLECTION_IS_NULL THEN NULL;
+           END;
+
+           resultDocument.worksheetCondFormatClose;
+
+        END LOOP;
+
+     EXCEPTION WHEN COLLECTION_IS_NULL THEN NULL;
+
+     END;
+
+     -- Define Columns
+
+     FOR colnum IN 1 .. v_worksheet_data(ws_index).col_count LOOP
+
+       v_col_width := NVL(TO_NUMBER(getStringElement(v_worksheet_data(ws_index).col_width_list,colnum,v_worksheet_data(ws_index).worksheet_list_delimiter)),v_default_col_width);
+
+       resultDocument.defineColumn(p_width=>v_col_width);
+     END LOOP;
+
+     -- Sheet Title Row
+     v_title := v_worksheet_data(ws_index).title;
+     IF v_title.title IS NOT NULL THEN
+
+        IF v_title.cell_span IS NULL OR v_title.cell_span >= v_worksheet_data(ws_index).col_count THEN
+
+            v_title.cell_span := v_worksheet_data(ws_index).col_count-1;
+
+        END IF;
+
+        resultDocument.rowOpen;
+        
+        IF isHRefData(v_title.title) THEN
+        
+           resultDocument.addCell(p_data      => getLinkLabel(v_title.title),
+                                  p_style     => UPPER(v_title.style),
+							      p_HRef      => getLinkTarget(v_title.title),
+                                  p_custom_attr=>'ss:MergeAcross="'||v_title.cell_span||'"');       
+        
+        ELSE
+        
+           resultDocument.addCell(p_style=>UPPER(v_title.style),p_data=>v_title.title,p_custom_attr=>'ss:MergeAcross="'||v_title.cell_span||'"');
+           
+        END IF;
+        
+        resultDocument.rowClose;
+
+     END IF;
+
+     -- Caption Row
+
+     IF v_worksheet_data(ws_index).col_caption IS NOT NULL THEN
+
+       resultDocument.rowOpen;
+       FOR colnum IN 1 .. v_worksheet_data(ws_index).col_count LOOP
+           
+         resultDocument.addCell(p_style=>'ColumnHeader',p_data=>getStringElement(v_worksheet_data(ws_index).col_caption,colnum));
+         
+       END LOOP;
+
+       resultDocument.rowClose;
+     
+     END IF;
+
+
+     -- Heading Row
+     v_header_repeat_attr := NULL;
+     
+     IF v_worksheet_data(ws_index).col_header_repeat THEN
+     
+         v_repeat_row := resultDocument.row_count+1;
+     
+         resultDocument.worksheetNamesOpen;
+         resultDocument.worksheetNamedRowRange(p_range_name => resultDocument.WT_REPEAT_HEADER_IND,
+                                               p_row_value  => SUBSTR(v_worksheet_data(ws_index).worksheet_name,1,31)||'!R'||v_repeat_row);
+     
+     
+         resultDocument.worksheetNamesClose;
+         
+         v_header_repeat_attr := resultDocument.WT_REPEAT_HEADER_IND;
+         
+     END IF;
+     
+     resultDocument.rowOpen;
+
+     FOR colnum IN 1 .. v_worksheet_data(ws_index).col_count LOOP
+     
+       
+       resultDocument.addCell(p_style=>NVL(getStringElement(UPPER(v_worksheet_data(ws_index).col_header_style_list),colnum,v_worksheet_data(ws_index).worksheet_list_delimiter),'ColumnHeader'),
+                              p_data=>getStringElement(v_worksheet_data(ws_index).col_header_list,colnum,v_worksheet_data(ws_index).worksheet_list_delimiter),
+                              p_named_cell_attr => v_header_repeat_attr);
+                              
+     
+     END LOOP;
+     
+
+
+     resultDocument.rowClose;
+	 
+	 v_freeze_row := 0;
+	 v_freeze_col := 0;
+     v_show_gridlines := TRUE;
+     
+     -- Freeze Header row if indicated.
+     IF NVL(v_worksheet_data(ws_index).col_header_freeze,FALSE) THEN
+	 
+	 
+	    v_freeze_row := resultDocument.row_count;
+        
+     END IF;
+	 
+     -- Freeze first column if indicated.
+     IF NVL(v_worksheet_data(ws_index).col_firstcol_freeze,FALSE) THEN
+	 
+	    v_freeze_col := 1;
+        
+     END IF;
+     
+     
+      IF NOT NVL(v_worksheet_data(ws_index).worksheet_show_gridlines,TRUE) THEN
+	 
+	    v_show_gridlines := FALSE;
+        
+      ELSE
+      
+        v_show_gridlines := TRUE;
+        
+      END IF;
+     
+	 
+	 
+	 resultDocument.worksheetOptions(p_freeze_horiz_row=>v_freeze_row,
+	                                 p_freeze_vertical_col=>v_freeze_col,
+                                     p_show_gridlines => v_show_gridlines);
+	 
+
+     v_results := buildDataSet(v_worksheet_data(ws_index).query,
+                               v_worksheet_data(ws_index).col_count);
+
+     v_count_rows := v_results.COUNT;
+
+     FOR r_index IN 1 .. v_results.COUNT LOOP
+
+        resultDocument.rowOpen;
+
+        v_row  := v_results(r_index);
+
+        FOR c_index IN 1 .. v_row.COUNT LOOP
+
+           v_data_type  := NVL(getStringElement(v_worksheet_data(ws_index).col_datatype_list,c_index,v_worksheet_data(ws_index).worksheet_list_delimiter),v_default_data_type);
+
+           v_data_style := NVL(UPPER(getStringElement(v_worksheet_data(ws_index).col_style_list,c_index,v_worksheet_data(ws_index).worksheet_list_delimiter)),NULL);
+
+           IF INSTR(v_style_list,v_data_style) = 0 THEN
+
+              v_data_style := NULL;
+
+           END IF;
+		   
+		   IF isHRefData(v_row(c_index)) THEN
+		   
+              resultDocument.addCell(p_data      => getLinkLabel(v_row(c_index)),
+                                     p_data_type => v_data_type,
+                                     p_style     => v_data_style,
+									 p_HRef      => getLinkTarget(v_row(c_index)));		      
+		   
+		   ELSE
+
+              resultDocument.addCell(p_data      => v_row(c_index),
+                                     p_data_type => v_data_type,
+                                     p_style     => v_data_style);
+									 
+		   END IF;							 
+
+        END LOOP;
+
+        v_row.DELETE;
+
+        resultDocument.rowClose;
+
+     END LOOP;
+
+     v_results.DELETE;
+
+     -- Formula Row
+     IF v_worksheet_data(ws_index).col_formula_list IS NOT NULL THEN
+
+        resultDocument.rowOpen;
+
+        FOR colnum IN 1 .. v_worksheet_data(ws_index).col_count LOOP
+        
+          -- If a formula result style is not defined, default to the style of the column being used by the formula.
+           
+          v_data_style := NVL(UPPER(getStringElement(v_worksheet_data(ws_index).col_formula_style_list,colnum,v_worksheet_data(ws_index).worksheet_list_delimiter)),
+                              UPPER(getStringElement(v_worksheet_data(ws_index).col_style_list,colnum,v_worksheet_data(ws_index).worksheet_list_delimiter)));
+          v_formula := replace(getStringElement(v_worksheet_data(ws_index).col_formula_list,colnum,v_worksheet_data(ws_index).worksheet_list_delimiter),'<ZMIN>',trim(to_char(v_count_rows)));
+          
+           IF v_formula IS NULL OR v_count_rows = 0 THEN -- Angus
+           
+            resultDocument.addCell(p_style => v_data_style); 
+               
+          ELSE
+          
+            IF upper(v_formula) IN ('SUM', 'AVERAGE', 'MIN', 'MAX', 'COUNT') THEN
+                v_formula := v_formula || '(R[-'|| trim(to_char(v_count_rows)) ||']C:R[-1]C)';
+            END IF;
+            
+            resultDocument.addCell(p_formula   => v_formula,
+                                   p_data_type => v_data_type,
+                                   p_style     => v_data_style);
+          END IF;
+         
+        END LOOP;
+
+        resultDocument.rowClose;
+     
+     END IF;
+
+     resultDocument.worksheetClose;
+
+  END LOOP;
+
+  resultDocument.documentClose;
+
+  RETURN resultDocument;
+
+END;
+
+
+/*=============*/
+/* END PACKAGE */
+/*=============*/
+END;
+/
+sho err;
